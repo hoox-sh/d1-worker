@@ -181,21 +181,6 @@ function tenantFilter(tenantId: string): { sql: string; binds: string[] } {
     : { sql: "", binds: [] };
 }
 
-/** Pull an optional `tenantId` from GET query params or a POST JSON body. */
-async function requestTenantId(request: Request): Promise<unknown> {
-  try {
-    if (request.method === "GET") {
-      return new URL(request.url).searchParams.get("tenantId");
-    }
-    const body = (await request.json().catch(() => null)) as {
-      tenantId?: unknown;
-    } | null;
-    return body?.tenantId;
-  } catch {
-    return undefined;
-  }
-}
-
 type ValidationResult = {
   valid: boolean;
   error?: string;
@@ -1138,26 +1123,39 @@ function parseListPagination(
   return { ok: true, limit, offset };
 }
 
-async function parseListRpcParams(
+/**
+ * Parse bound limit/offset plus an optional caller-supplied `tenantId` from a
+ * list RPC request. Reads the request stream exactly once — pagination and
+ * tenant must come from the same read, otherwise a second read sees a
+ * consumed stream (null) and silently drops the tenant filter on POST.
+ */
+async function parseListRpcParamsWithTenant(
   request: Request,
   defaultLimit: number
 ): Promise<
-  | { ok: true; limit: number; offset: number }
+  | { ok: true; limit: number; offset: number; tenantId: unknown }
   | { ok: false; response: Response }
 > {
   if (request.method === "GET") {
-    return parseListPagination(new URL(request.url).searchParams, defaultLimit);
+    const params = new URL(request.url).searchParams;
+    const pagination = parseListPagination(params, defaultLimit);
+    if (!pagination.ok) return pagination;
+    return { ...pagination, tenantId: params.get("tenantId") };
   }
   // POST: empty body is allowed (defaults); otherwise JSON object
   if (!request.body) {
-    return parseListPagination({}, defaultLimit);
+    const pagination = parseListPagination({}, defaultLimit);
+    if (!pagination.ok) return pagination;
+    return { ...pagination, tenantId: undefined };
   }
   const contentType = request.headers.get("Content-Type") || "";
   // Allow POST with no JSON when Content-Type is missing/empty (defaults)
   if (!contentType.includes("application/json")) {
     const contentLength = request.headers.get("Content-Length");
     if (!contentLength || contentLength === "0") {
-      return parseListPagination({}, defaultLimit);
+      const pagination = parseListPagination({}, defaultLimit);
+      if (!pagination.ok) return pagination;
+      return { ...pagination, tenantId: undefined };
     }
     return {
       ok: false,
@@ -1166,7 +1164,9 @@ async function parseListRpcParams(
   }
   const body = await rpcJsonBody(request);
   if (!body.ok) return body;
-  return parseListPagination(body.value, defaultLimit);
+  const pagination = parseListPagination(body.value, defaultLimit);
+  if (!pagination.ok) return pagination;
+  return { ...pagination, tenantId: body.value.tenantId };
 }
 
 /** POST /rpc/insert-trade — insert a executed trade row */
@@ -1371,12 +1371,12 @@ async function handleListSignals(
   request: Request,
   env: Env
 ): Promise<Response> {
-  const pagination = await parseListRpcParams(request, 10);
-  if (!pagination.ok) return pagination.response;
-  const { limit, offset } = pagination;
-  const rowTenant = resolveRowTenant(env, {
-    tenantId: await requestTenantId(request),
-  });
+  // Single body read: pagination + tenantId together (see
+  // parseListRpcParamsWithTenant — a second read would see a consumed stream).
+  const parsed = await parseListRpcParamsWithTenant(request, 10);
+  if (!parsed.ok) return parsed.response;
+  const { limit, offset, tenantId } = parsed;
+  const rowTenant = resolveRowTenant(env, { tenantId });
   const scope = tenantFilter(rowTenant);
   try {
     const result = await env.DB.prepare(
@@ -1411,12 +1411,12 @@ async function handleListSystemLogs(
   request: Request,
   env: Env
 ): Promise<Response> {
-  const pagination = await parseListRpcParams(request, 20);
-  if (!pagination.ok) return pagination.response;
-  const { limit, offset } = pagination;
-  const rowTenant = resolveRowTenant(env, {
-    tenantId: await requestTenantId(request),
-  });
+  // Single body read: pagination + tenantId together (see
+  // parseListRpcParamsWithTenant — a second read would see a consumed stream).
+  const parsed = await parseListRpcParamsWithTenant(request, 20);
+  if (!parsed.ok) return parsed.response;
+  const { limit, offset, tenantId } = parsed;
+  const rowTenant = resolveRowTenant(env, { tenantId });
   const scope = tenantFilter(rowTenant);
   try {
     const result = await env.DB.prepare(

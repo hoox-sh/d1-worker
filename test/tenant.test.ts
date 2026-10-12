@@ -168,6 +168,42 @@ describe("d1-worker tenant row isolation", () => {
     expect(sel!.sql).not.toContain("tenant_id");
   });
 
+  test("POST list-signals keeps POST-body tenant (single read)", async () => {
+    const db = createRecordingDB();
+    const res = await (d1Worker as any).fetch(
+      new Request("https://d1.local/rpc/list-signals", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ limit: 5, tenantId: "shared-1" }),
+      }),
+      plainEnv(db, createMockKV()),
+      createCtx()
+    );
+    expect(res.status).toBe(200);
+    const sel = db.recorded.find((r) => /FROM trade_signals/i.test(r.sql));
+    expect(sel).toBeDefined();
+    expect(sel!.sql).toContain("tenant_id = ?");
+    expect(sel!.binds).toContain("shared-1");
+  });
+
+  test("POST list-system-logs keeps POST-body tenant (single read)", async () => {
+    const db = createRecordingDB();
+    const res = await (d1Worker as any).fetch(
+      new Request("https://d1.local/rpc/list-system-logs", {
+        method: "POST",
+        headers: authHeaders,
+        body: JSON.stringify({ limit: 5, tenantId: "shared-2" }),
+      }),
+      plainEnv(db, createMockKV()),
+      createCtx()
+    );
+    expect(res.status).toBe(200);
+    const sel = db.recorded.find((r) => /FROM system_logs/i.test(r.sql));
+    expect(sel).toBeDefined();
+    expect(sel!.sql).toContain("tenant_id = ?");
+    expect(sel!.binds).toContain("shared-2");
+  });
+
   test("free-form /query is rejected in tenant mode", async () => {
     const db = createRecordingDB();
     const res = await (d1Worker as any).fetch(
