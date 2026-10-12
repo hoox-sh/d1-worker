@@ -13,10 +13,7 @@ import {
   createRouter,
   type MiddlewareHandler,
 } from "@hoox-sh/hoox-shared/router";
-import type {
-  QueryPayload,
-  BatchPayload,
-} from "@hoox-sh/hoox-shared/types";
+import type { QueryPayload, BatchPayload } from "@hoox-sh/hoox-shared/types";
 import { trackAnalytics } from "@hoox-sh/hoox-shared/analytics";
 import {
   createLogger,
@@ -35,6 +32,12 @@ import {
   D1_WRITE_AUTH_KEY_FIELDS,
 } from "@hoox-sh/hoox-shared/service-bindings";
 import { computeDashboardStats } from "./stats";
+import {
+  effectiveTenantId,
+  isTenantFlagOn,
+  scopeKey,
+  type TenantEnv,
+} from "@hoox-sh/hoox-shared/tenant";
 
 const logger = createLogger({ service: "d1-worker", module: "router" });
 
@@ -44,6 +47,9 @@ export interface Env extends Cloudflare.Env {
   DB: D1Database;
   CONFIG_KV: KVNamespace;
   LOG_LIMIT?: string; // Optional binding, defaults to "50"
+  /** Opt-in tenant isolation (see @hoox-sh/hoox-shared/tenant). Absent = self-host default. */
+  TENANT_ID?: string;
+  TENANT_MODE?: string;
 }
 
 // Known KV key prefixes the dashboard reads/writes. Mirrors the prefix list
@@ -101,6 +107,94 @@ const FORBIDDEN_SQL_KEYWORDS = [
 const MAX_SQL_LENGTH = 8_192;
 const MAX_BATCH_STATEMENTS = 50;
 const MAX_PARAMS_PER_STATEMENT = 64;
+
+// ── Tenant row isolation ───────────────────────────────────────────
+// Every allowlisted table carries a `tenant_id` column (fresh DBs via
+// workers/trade-worker/schema.sql; existing DBs via ensureTenantSchema
+// below). Writes stamp the effective tenant; reads filter on it. When the
+// flag is off all helpers are identity and SQL is unscoped (self-host).
+
+const TENANT_TABLES: readonly string[] = TABLE_ALLOWLIST;
+
+let tenantSchemaReady: Promise<void> | null = null;
+
+/**
+ * Idempotent startup migration: ADD COLUMN tenant_id + index on each
+ * existing allowlisted table. Cached per isolate; never throws (logs and
+ * continues — a missing column only matters when scoping is active, and
+ * the scoped statements would then surface the real error).
+ */
+function ensureTenantSchema(db: D1Database): Promise<void> {
+  if (!tenantSchemaReady) {
+    tenantSchemaReady = (async () => {
+      try {
+        const existing = await db
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+          .all<{ name: string }>();
+        const names = new Set(
+          (existing.results ?? []).map((r) => String(r.name).toLowerCase())
+        );
+        for (const table of TENANT_TABLES) {
+          if (!names.has(table.toLowerCase())) continue;
+          try {
+            await db
+              .prepare(
+                `ALTER TABLE ${table} ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''`
+              )
+              .run();
+          } catch (error) {
+            // Duplicate-column on re-run; anything else is logged below.
+            if (!/duplicate column name/i.test(toError(error))) throw error;
+          }
+          await db
+            .prepare(
+              `CREATE INDEX IF NOT EXISTS idx_${table}_tenant_id ON ${table} (tenant_id)`
+            )
+            .run();
+        }
+      } catch (error) {
+        logger.warn("tenant schema ensure failed", { error: toError(error) });
+      }
+    })();
+  }
+  return tenantSchemaReady;
+}
+
+/** Test hook: reset the cached migration promise between cases. */
+export function __resetTenantSchemaCacheForTest(): void {
+  tenantSchemaReady = null;
+}
+
+/**
+ * Effective tenant for a D1 read/write: the env tenant when TENANT_MODE is
+ * on (authoritative, throws when misconfigured), else a caller-supplied
+ * `tenantId` (shared-DB path), else "" (unscoped self-host rows).
+ */
+function resolveRowTenant(env: Env, msg?: { tenantId?: unknown }): string {
+  return effectiveTenantId(env as TenantEnv, msg) ?? "";
+}
+
+/** `AND tenant_id = ?` fragment + bind value, or empty when unscoped. */
+function tenantFilter(tenantId: string): { sql: string; binds: string[] } {
+  return tenantId
+    ? { sql: "AND tenant_id = ?", binds: [tenantId] }
+    : { sql: "", binds: [] };
+}
+
+/** Pull an optional `tenantId` from GET query params or a POST JSON body. */
+async function requestTenantId(request: Request): Promise<unknown> {
+  try {
+    if (request.method === "GET") {
+      return new URL(request.url).searchParams.get("tenantId");
+    }
+    const body = (await request.json().catch(() => null)) as {
+      tenantId?: unknown;
+    } | null;
+    return body?.tenantId;
+  } catch {
+    return undefined;
+  }
+}
 
 type ValidationResult = {
   valid: boolean;
@@ -446,6 +540,14 @@ router.post(
   async (request: Request, env: Env, ctx: ExecutionContext) => {
     const startTime = Date.now();
 
+    // Free-form SELECT cannot be tenant-rewritten safely: reject in tenant
+    // mode so cross-tenant reads must go through the scoped /rpc/* set.
+    if (isTenantFlagOn(env)) {
+      return Errors.forbidden(
+        "Free-form /query is disabled in tenant mode. Use the tenant-scoped /rpc/* endpoints."
+      );
+    }
+
     try {
       const bodyGuard = requireJsonBody(request);
       if (bodyGuard) return bodyGuard;
@@ -561,6 +663,13 @@ router.post(
   "/batch",
   async (request: Request, env: Env, ctx: ExecutionContext) => {
     const startTime = Date.now();
+
+    // Same tenant rationale as /query: fixed /rpc/* templates only.
+    if (isTenantFlagOn(env)) {
+      return Errors.forbidden(
+        "Free-form /batch is disabled in tenant mode. Use the tenant-scoped /rpc/* endpoints."
+      );
+    }
 
     try {
       const bodyGuard = requireJsonBody(request);
@@ -694,20 +803,33 @@ router.get(
 
       const prefixes: readonly KnownPrefix[] = KNOWN_PREFIXES;
 
-      // List all prefixes in parallel
+      // Tenant-scoped list prefixes when the flag is on (identity otherwise).
+      const tenantEnv = env as TenantEnv;
       const lists = await Promise.all(
-        prefixes.map((prefix) => env.CONFIG_KV.list({ prefix }))
+        prefixes.map((prefix) =>
+          env.CONFIG_KV.list({ prefix: scopeKey(tenantEnv, prefix) })
+        )
       );
 
-      // Collect all key names from all lists
+      // Collect all key names from all lists, stripping the tenant scope
+      // back to canonical keys so clients see stable key shapes.
+      const scopePrefix = isTenantFlagOn(env)
+        ? scopeKey(tenantEnv, "").replace(/\/$/, "/")
+        : "";
       const allKeys: string[] = [];
       for (const list of lists) {
-        allKeys.push(...list.keys.map((k) => k.name));
+        for (const k of list.keys) {
+          allKeys.push(
+            scopePrefix && k.name.startsWith(scopePrefix)
+              ? k.name.slice(scopePrefix.length)
+              : k.name
+          );
+        }
       }
 
-      // Get all values in parallel
+      // Get all values in parallel (re-scope canonical keys for the read)
       const values = await Promise.all(
-        allKeys.map((key) => env.CONFIG_KV.get(key))
+        allKeys.map((key) => env.CONFIG_KV.get(scopeKey(tenantEnv, key)))
       );
 
       // Build settings object
@@ -752,14 +874,18 @@ router.post(
 
       // The dashboard already sends fully-prefixed keys (e.g. "global:kill_switch").
       // Store the key as-is to avoid double-prefixing. Validate it starts with one
-      // of the known prefixes to keep the KV namespace well-formed.
+      // of the known prefixes to keep the KV namespace well-formed, then apply
+      // the tenant scope (identity when the flag is off).
       if (!hasKnownPrefix(key)) {
         return Errors.badRequest(
           `Key must start with one of: ${KNOWN_PREFIXES.join(", ")}`
         );
       }
 
-      await env.CONFIG_KV.put(key, JSON.stringify(payload.value ?? {}));
+      await env.CONFIG_KV.put(
+        scopeKey(env as TenantEnv, key),
+        JSON.stringify(payload.value ?? {})
+      );
 
       return createJsonResponse({ success: true, key });
     } catch (error) {
@@ -773,8 +899,17 @@ router.post(
 
 // --- Extracted Handler Functions ---
 
-async function handleGetBalances(env: Env, logger: Logger): Promise<Response> {
+async function handleGetBalances(
+  request: Request,
+  env: Env,
+  logger: Logger
+): Promise<Response> {
   try {
+    // Env tenant wins when the flag is on; else an explicit ?tenantId=.
+    const rowTenant = resolveRowTenant(env, {
+      tenantId: new URL(request.url).searchParams.get("tenantId"),
+    });
+    const scope = tenantFilter(rowTenant);
     const latestSnapshots = await env.DB.prepare(
       `
     SELECT b.exchange, b.asset, b.total, b.timestamp
@@ -782,10 +917,14 @@ async function handleGetBalances(env: Env, logger: Logger): Promise<Response> {
     INNER JOIN (
       SELECT exchange, asset, MAX(timestamp) as max_time
       FROM balances
+      WHERE 1 = 1 ${scope.sql}
       GROUP BY exchange, asset
     ) latest ON b.exchange = latest.exchange AND b.asset = latest.asset AND b.timestamp = latest.max_time
+    WHERE 1 = 1 ${scope.sql.replaceAll("tenant_id", "b.tenant_id")}
   `
-    ).all();
+    )
+      .bind(...scope.binds, ...scope.binds)
+      .all();
 
     const totalBalance = (latestSnapshots.results || []).reduce(
       (sum: number, row: Record<string, unknown>) => {
@@ -806,15 +945,25 @@ async function handleGetBalances(env: Env, logger: Logger): Promise<Response> {
   }
 }
 
-async function handleGetPositions(env: Env, logger: Logger): Promise<Response> {
+async function handleGetPositions(
+  request: Request,
+  env: Env,
+  logger: Logger
+): Promise<Response> {
   try {
     // Fixed column list (no SELECT *) — same shape as /rpc/list-open-positions
+    const rowTenant = resolveRowTenant(env, {
+      tenantId: new URL(request.url).searchParams.get("tenantId"),
+    });
+    const scope = tenantFilter(rowTenant);
     const positionsData = await env.DB.prepare(
       `SELECT id, exchange, symbol, side, size, status, updated_at
        FROM positions
-       WHERE status = 'OPEN'
+       WHERE status = 'OPEN' ${scope.sql}
        ORDER BY updated_at DESC`
-    ).all();
+    )
+      .bind(...scope.binds)
+      .all();
 
     return createJsonResponse({
       success: true,
@@ -830,47 +979,51 @@ async function handleGetPositions(env: Env, logger: Logger): Promise<Response> {
 // Dashboard balances endpoint
 router.get(
   "/api/balances",
-  async (_request: Request, env: Env, _ctx: ExecutionContext) =>
-    handleGetBalances(env, logger),
+  async (request: Request, env: Env, _ctx: ExecutionContext) =>
+    handleGetBalances(request, env, logger),
   [requireReadAuth]
 );
 
 // Dashboard positions endpoint
 router.get(
   "/api/positions",
-  async (_request: Request, env: Env, _ctx: ExecutionContext) =>
-    handleGetPositions(env, logger),
+  async (request: Request, env: Env, _ctx: ExecutionContext) =>
+    handleGetPositions(request, env, logger),
   [requireReadAuth]
 );
 
 // Dashboard-prefixed aliases for agent-worker compatibility
 router.get(
   "/api/dashboard/balances",
-  async (_request: Request, env: Env, _ctx: ExecutionContext) =>
-    handleGetBalances(env, logger),
+  async (request: Request, env: Env, _ctx: ExecutionContext) =>
+    handleGetBalances(request, env, logger),
   [requireReadAuth]
 );
 
 router.get(
   "/api/dashboard/positions",
-  async (_request: Request, env: Env, _ctx: ExecutionContext) =>
-    handleGetPositions(env, logger),
+  async (request: Request, env: Env, _ctx: ExecutionContext) =>
+    handleGetPositions(request, env, logger),
   [requireReadAuth]
 );
 
 // Dashboard logs endpoint
 router.get(
   "/api/logs",
-  async (_request: Request, env: Env, _ctx: ExecutionContext) => {
+  async (request: Request, env: Env, _ctx: ExecutionContext) => {
     try {
       const limit = Math.min(
         Math.max(parseInt(env.LOG_LIMIT || "50", 10) || 50, 1),
         1000
       );
+      const rowTenant = resolveRowTenant(env, {
+        tenantId: new URL(request.url).searchParams.get("tenantId"),
+      });
+      const scope = tenantFilter(rowTenant);
       const logsData = await env.DB.prepare(
-        "SELECT id, timestamp, level, module, message, context FROM system_logs ORDER BY timestamp DESC LIMIT ?"
+        `SELECT id, timestamp, level, module, message, context FROM system_logs WHERE 1 = 1 ${scope.sql} ORDER BY timestamp DESC LIMIT ?`
       )
-        .bind(limit)
+        .bind(...scope.binds, limit)
         .all();
 
       return createJsonResponse({
@@ -889,8 +1042,11 @@ router.get(
 // Dashboard stats endpoint
 router.get(
   "/api/dashboard/stats",
-  async (_request: Request, env: Env, _ctx: ExecutionContext) => {
-    const result = await computeDashboardStats(env.DB);
+  async (request: Request, env: Env, _ctx: ExecutionContext) => {
+    const rowTenant = resolveRowTenant(env, {
+      tenantId: new URL(request.url).searchParams.get("tenantId"),
+    });
+    const result = await computeDashboardStats(env.DB, rowTenant || undefined);
     if ("error" in result) {
       logger.error("Dashboard stats error", { error: result.error });
       return Errors.internal(result.error);
@@ -943,13 +1099,9 @@ function parseListPagination(
   | { ok: true; limit: number; offset: number }
   | { ok: false; response: Response } {
   const rawLimit =
-    source instanceof URLSearchParams
-      ? source.get("limit")
-      : source.limit;
+    source instanceof URLSearchParams ? source.get("limit") : source.limit;
   const rawOffset =
-    source instanceof URLSearchParams
-      ? source.get("offset")
-      : source.offset;
+    source instanceof URLSearchParams ? source.get("offset") : source.offset;
 
   let limit = defaultLimit;
   if (rawLimit !== null && rawLimit !== undefined && rawLimit !== "") {
@@ -1036,11 +1188,13 @@ router.post(
     if (!exchange || !symbol || !action || !Number.isFinite(quantity)) {
       return Errors.badRequest("Required: exchange, symbol, action, quantity");
     }
+    // Tenant stamp: env tenant when the flag is on, else caller-supplied, else "".
+    const rowTenant = resolveRowTenant(env, b as { tenantId?: unknown });
     try {
       const result = await prepareValidatedWrite(
         env,
-        `INSERT INTO trades (id, timestamp, exchange, symbol, action, quantity, price, leverage, status, raw_response)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO trades (id, timestamp, exchange, symbol, action, quantity, price, leverage, status, raw_response, tenant_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
         .bind(
           id,
@@ -1054,7 +1208,8 @@ router.post(
           String(b.status ?? "EXECUTED"),
           typeof b.raw_response === "string"
             ? b.raw_response
-            : JSON.stringify(b.raw_response ?? null)
+            : JSON.stringify(b.raw_response ?? null),
+          rowTenant
         )
         .run();
       if (!result.success) {
@@ -1093,13 +1248,14 @@ router.post(
     if (!id || !exchange || !symbol || !side || !Number.isFinite(size)) {
       return Errors.badRequest("Required: id, exchange, symbol, side, size");
     }
+    const rowTenant = resolveRowTenant(env, b as { tenantId?: unknown });
     try {
       const result = await prepareValidatedWrite(
         env,
-        `REPLACE INTO positions (id, exchange, symbol, side, size, status, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
+        `REPLACE INTO positions (id, exchange, symbol, side, size, status, updated_at, tenant_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       )
-        .bind(id, exchange, symbol, side, size, status, updatedAt)
+        .bind(id, exchange, symbol, side, size, status, updatedAt, rowTenant)
         .run();
       if (!result.success) {
         throw new Error(result.error || "upsert-position failed");
@@ -1132,11 +1288,12 @@ router.post(
     if (!symbol || !signalType || !Number.isFinite(timestamp)) {
       return Errors.badRequest("Required: symbol, signal_type, timestamp");
     }
+    const rowTenant = resolveRowTenant(env, b as { tenantId?: unknown });
     try {
       const result = await prepareValidatedWrite(
         env,
-        `INSERT INTO trade_signals (signal_id, timestamp, symbol, signal_type, source, raw_data)
-         VALUES (?, ?, ?, ?, ?, ?)`
+        `INSERT INTO trade_signals (signal_id, timestamp, symbol, signal_type, source, raw_data, tenant_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
       )
         .bind(
           signalId,
@@ -1146,7 +1303,8 @@ router.post(
           b.source ?? null,
           typeof b.raw_data === "string"
             ? b.raw_data
-            : JSON.stringify(b.raw_data ?? null)
+            : JSON.stringify(b.raw_data ?? null),
+          rowTenant
         )
         .run();
       if (!result.success) {
@@ -1174,10 +1332,11 @@ router.post(
     if (!message) {
       return Errors.badRequest("Required: message");
     }
+    const rowTenant = resolveRowTenant(env, b as { tenantId?: unknown });
     try {
       const result = await prepareValidatedWrite(
         env,
-        `INSERT INTO system_logs (level, source, message, details) VALUES (?, ?, ?, ?)`
+        `INSERT INTO system_logs (level, source, message, details, tenant_id) VALUES (?, ?, ?, ?, ?)`
       )
         .bind(
           level,
@@ -1185,7 +1344,8 @@ router.post(
           message,
           typeof b.details === "string"
             ? b.details
-            : JSON.stringify(b.details ?? null)
+            : JSON.stringify(b.details ?? null),
+          rowTenant
         )
         .run();
       if (!result.success) {
@@ -1214,14 +1374,19 @@ async function handleListSignals(
   const pagination = await parseListRpcParams(request, 10);
   if (!pagination.ok) return pagination.response;
   const { limit, offset } = pagination;
+  const rowTenant = resolveRowTenant(env, {
+    tenantId: await requestTenantId(request),
+  });
+  const scope = tenantFilter(rowTenant);
   try {
     const result = await env.DB.prepare(
       `SELECT signal_id, timestamp, symbol, signal_type, source, processed_at
        FROM trade_signals
+       WHERE 1 = 1 ${scope.sql}
        ORDER BY processed_at DESC
        LIMIT ? OFFSET ?`
     )
-      .bind(limit, offset)
+      .bind(...scope.binds, limit, offset)
       .all();
     if (!result.success) {
       throw new Error(result.error || "list-signals failed");
@@ -1249,14 +1414,19 @@ async function handleListSystemLogs(
   const pagination = await parseListRpcParams(request, 20);
   if (!pagination.ok) return pagination.response;
   const { limit, offset } = pagination;
+  const rowTenant = resolveRowTenant(env, {
+    tenantId: await requestTenantId(request),
+  });
+  const scope = tenantFilter(rowTenant);
   try {
     const result = await env.DB.prepare(
       `SELECT id, timestamp, level, service, message, details
        FROM system_logs
+       WHERE 1 = 1 ${scope.sql}
        ORDER BY timestamp DESC
        LIMIT ? OFFSET ?`
     )
-      .bind(limit, offset)
+      .bind(...scope.binds, limit, offset)
       .all();
     if (!result.success) {
       throw new Error(result.error || "list-system-logs failed");
@@ -1287,17 +1457,22 @@ async function handleListOpenPositions(
   env: Env
 ): Promise<Response> {
   let exchange: string | undefined;
+  let filterTenant: unknown;
   try {
     if (request.method === "GET") {
-      const ex = new URL(request.url).searchParams.get("exchange");
+      const params = new URL(request.url).searchParams;
+      const ex = params.get("exchange");
       if (ex != null && ex.trim() !== "") exchange = ex.trim();
+      filterTenant = params.get("tenantId");
     } else {
       const body = (await request.json().catch(() => null)) as {
         exchange?: unknown;
+        tenantId?: unknown;
       } | null;
       if (body && typeof body.exchange === "string" && body.exchange.trim()) {
         exchange = body.exchange.trim();
       }
+      filterTenant = body?.tenantId;
     }
   } catch {
     return Errors.badRequest("Invalid request for list-open-positions");
@@ -1314,15 +1489,18 @@ async function handleListOpenPositions(
     }
   }
 
+  const rowTenant = resolveRowTenant(env, { tenantId: filterTenant });
+  const scope = tenantFilter(rowTenant);
+
   try {
     if (exchange) {
       const result = await env.DB.prepare(
         `SELECT id, exchange, symbol, side, size, status, updated_at
          FROM positions
-         WHERE status = 'OPEN' AND exchange = ?
+         WHERE status = 'OPEN' AND exchange = ? ${scope.sql}
          ORDER BY updated_at DESC`
       )
-        .bind(exchange)
+        .bind(exchange, ...scope.binds)
         .all();
       if (!result.success) {
         throw new Error(result.error || "list-open-positions failed");
@@ -1338,9 +1516,11 @@ async function handleListOpenPositions(
     const result = await env.DB.prepare(
       `SELECT id, exchange, symbol, side, size, status, updated_at
        FROM positions
-       WHERE status = 'OPEN'
+       WHERE status = 'OPEN' ${scope.sql}
        ORDER BY updated_at DESC`
-    ).all();
+    )
+      .bind(...scope.binds)
+      .all();
     if (!result.success) {
       throw new Error(result.error || "list-open-positions failed");
     }
@@ -1378,6 +1558,8 @@ export default {
         );
       }
       try {
+        // Idempotent per-isolate migration for row-level tenant isolation.
+        await ensureTenantSchema(env.DB);
         const response = await router.handle(request, env, ctx);
         const wrapped = new Response(response.body, response);
         for (const [key, value] of Object.entries(corsHeadersOrEmpty)) {

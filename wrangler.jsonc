@@ -10,7 +10,8 @@
     "@hoox-sh/hoox-shared/analytics": "../../packages/shared/src/analytics.ts",
     "@hoox-sh/hoox-shared/health": "../../packages/shared/src/health.ts",
     "@hoox-sh/hoox-shared/types/router": "../../packages/shared/src/types/router.ts",
-    "@hoox-sh/hoox-shared/service-bindings": "../../packages/shared/src/service-bindings.ts"
+    "@hoox-sh/hoox-shared/service-bindings": "../../packages/shared/src/service-bindings.ts",
+    "@hoox-sh/hoox-shared/tenant": "../../packages/shared/src/tenant.ts"
   },
   "compatibility_date": "2026-06-08",
   "compatibility_flags": ["nodejs_compat"],
